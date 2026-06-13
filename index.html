@@ -1383,6 +1383,8 @@
         const audioUploadInput = document.getElementById('audio-upload');
         const states = { initial: document.getElementById('demo-initial-state'), recording: document.getElementById('demo-recording-state'), loading: document.getElementById('demo-loading-state'), results: document.getElementById('demo-results-state') };
         let timerInterval;
+        let mediaRecorder = null;
+        let audioChunks = [];
 
         const showModalState = (stateName) => {
             Object.values(states).forEach(s => s.classList.add('hidden'));
@@ -1403,6 +1405,9 @@
             modalBackdrop.classList.add('opacity-0');
             modalBox.classList.add('scale-95');
             clearInterval(timerInterval);
+            if (mediaRecorder && mediaRecorder.state !== "inactive") {
+                mediaRecorder.stop();
+            }
             setTimeout(() => {
                 demoModal.classList.add('hidden');
                 demoModal.classList.remove('flex');
@@ -1415,96 +1420,123 @@
         modalBackdrop.addEventListener('click', closeModal);
         analyzeAgainBtn.addEventListener('click', () => showModalState('initial'));
 
-        startAnalysisBtn.addEventListener('click', () => {
-            showModalState('recording');
-            let timeLeft = 10;
-            const timerText = document.getElementById('timer-text');
-            const timerCircle = document.getElementById('timer-circle');
-            const circumference = 2 * Math.PI * 48;
-            timerCircle.style.strokeDashoffset = circumference;
+        startAnalysisBtn.addEventListener('click', async () => {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                alert("Microphone recording is not supported in this browser. Please upload an audio file instead.");
+                return;
+            }
 
-            timerInterval = setInterval(() => {
-                timeLeft--;
-                timerText.textContent = `${timeLeft}s`;
-                const offset = circumference - (timeLeft / 10) * circumference;
-                timerCircle.style.strokeDashoffset = offset;
-                if (timeLeft <= 0) {
-                    clearInterval(timerInterval);
-                    runAnalysis();
-                }
-            }, 1000);
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioChunks = [];
+                mediaRecorder = new MediaRecorder(stream);
+                
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+                    const file = new File([audioBlob], "recording.wav", { type: mediaRecorder.mimeType });
+                    runAnalysis(file);
+                    stream.getTracks().forEach(track => track.stop());
+                };
+
+                showModalState('recording');
+                let timeLeft = 10;
+                const timerText = document.getElementById('timer-text');
+                const timerCircle = document.getElementById('timer-circle');
+                const circumference = 2 * Math.PI * 48;
+                timerCircle.style.strokeDashoffset = circumference;
+
+                mediaRecorder.start();
+
+                timerInterval = setInterval(() => {
+                    timeLeft--;
+                    timerText.textContent = `${timeLeft}s`;
+                    const offset = circumference - (timeLeft / 10) * circumference;
+                    timerCircle.style.strokeDashoffset = offset;
+                    if (timeLeft <= 0) {
+                        clearInterval(timerInterval);
+                        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+                            mediaRecorder.stop();
+                        }
+                    }
+                }, 1000);
+
+            } catch (err) {
+                console.error("Microphone access error:", err);
+                alert("Microphone access is required to record. Please ensure permissions are granted, or upload an audio file instead.");
+                showModalState('initial');
+            }
         });
 
         audioUploadInput.addEventListener('change', (event) => {
             if (event.target.files && event.target.files[0]) {
                 const file = event.target.files[0];
                 console.log(`File selected: ${file.name}`);
-                runAnalysis();
+                runAnalysis(file);
             }
         });
 
-        const runAnalysis = () => {
+        const runAnalysis = async (file) => {
             showModalState('loading');
-            const progressBar = document.getElementById('progress-bar');
-            let progress = 0;
-            const analysisInterval = setInterval(() => {
-                progress += 10;
-                progressBar.style.width = `${progress}%`;
-                if (progress >= 100) {
-                    clearInterval(analysisInterval);
-                    setTimeout(showResults, 500);
-                }
-            }, 200);
-        };
 
-        const getAISuggestion = async (results) => {
-            const topCry = Object.entries(results).reduce((a, b) => a[1] > b[1] ? a : b);
-            const prompt = `My baby is crying. An AI analysis suggests the most likely reason is ${topCry[0]} with ${topCry[1]}% confidence. The other possibilities are ${Object.entries(results).filter(r => r[0] !== topCry[0]).map(r => `${r[0]} (${r[1]}%)`).join(', ')}. Provide a short, actionable, and empathetic suggestion for the parent in 1-2 sentences. Do not use markdown.`;
-            const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
-            const apiKey = "AIzaSyBfo5XqFONj1U-MM6ydOLts0zFLM0mG1dE";
-            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+            const formData = new FormData();
+            formData.append("audio", file);
+
             try {
-                const response = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-                if (!response.ok) throw new Error(`API error: ${response.statusText}`);
-                const result = await response.json();
-                return result.candidates[0].content.parts[0].text;
+                const response = await fetch(
+                    "http://127.0.0.1:8000/predict",
+                    {
+                        method: "POST",
+                        body: formData
+                    }
+                );
+
+                const data = await response.json();
+                console.log(data);
+
+                const cryData = {};
+                Object.entries(data.scores).forEach(([key, value]) => {
+                    cryData[key] = Math.round(value * 100);
+                });
+
+                showResults(cryData, data.suggestion);
+
             } catch (error) {
-                console.error("Gemini API Error:", error);
-                return `It looks like your baby might be ${topCry[0].toLowerCase()}. Consider checking if they need to be fed, changed, or comforted.`;
+                console.error(error);
+                alert("Prediction failed");
+                showModalState('initial');
             }
         };
 
-        const showResults = async () => {
+        const showResults = async (cryData, suggestion) => {
             showModalState('results');
+
             const resultsGrid = document.getElementById('results-grid');
             const suggestedActionEl = document.getElementById('suggested-action');
+
             resultsGrid.innerHTML = '';
-            suggestedActionEl.innerHTML = `<i data-lucide="loader" class="w-5 h-5 animate-spin"></i>`;
-            lucide.createIcons();
 
-            const hungerPercent = Math.floor(Math.random() * 11) + 50;
-            let remainder = 100 - hungerPercent;
-            let otherValues = Array.from({ length: 3 }, () => Math.random());
-            const totalOther = otherValues.reduce((sum, val) => sum + val, 0);
-            let otherPercentages = otherValues.map(val => Math.floor((val / totalOther) * remainder));
-            let otherTotal = otherPercentages.reduce((sum, val) => sum + val, 0);
-            let adjustment = remainder - otherTotal;
-            while (adjustment > 0) {
-                let randomIndex = Math.floor(Math.random() * otherPercentages.length);
-                otherPercentages[randomIndex]++;
-                adjustment--;
-            }
+            // Sort highest confidence first
+            const sortedResults = Object.entries(cryData)
+                .sort((a, b) => b[1] - a[1]);
 
-            const cryData = {
-                Hunger: hungerPercent,
-                Sleepy: otherPercentages[0],
-                Discomfort: otherPercentages[1],
-                Pain: otherPercentages[2]
+            const topCryName = sortedResults[0][0];
+
+            // Standardize prediction labels mapping
+            const labelMap = {
+                hungry: "Hungry",
+                tired: "Tired",
+                discomfort: "Discomfort",
+                burping: "Burping",
+                belly_pain: "Belly Pain"
             };
 
-            const topCryName = 'Hunger';
-
-            Object.entries(cryData).forEach(([name, value]) => {
+            sortedResults.forEach(([name, value]) => {
                 const resultItem = document.createElement('div');
                 const isTopCry = name === topCryName;
                 let classes = 'p-3 rounded-2xl border transition-all duration-300 transform';
@@ -1518,8 +1550,11 @@
                 const headingColorClass = isTopCry ? 'text-white' : 'font-bold';
                 const progressBgClass = isTopCry ? 'bg-green-800' : 'bg-gray-200';
                 const progressBarClass = isTopCry ? 'bg-white' : 'bg-slate-900';
+                
+                const displayName = labelMap[name] || name.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase());
+
                 resultItem.innerHTML = `
-                    <div class="text-xs ${textColorClass}">${name}</div>
+                    <div class="text-xs ${textColorClass}">${displayName}</div>
                     <div class="text-2xl ${headingColorClass} mt-1">${value}%</div>
                     <div class="relative h-2 mt-2 w-full overflow-hidden rounded-full ${progressBgClass}">
                         <div class="h-full w-full flex-1 ${progressBarClass} transition-all" style="transform: translateX(-${100 - value}%);"></div>
@@ -1528,10 +1563,12 @@
                 resultsGrid.appendChild(resultItem);
             });
 
-            const suggestion = await getAISuggestion(cryData);
-            suggestedActionEl.textContent = suggestion;
+            suggestedActionEl.textContent = suggestion || "No recommendation available.";
+            
             const analysisData = { results: cryData, suggestion: suggestion };
             await saveCryAnalysis(analysisData);
+
+            lucide.createIcons();
         };
 
         // --- Chatbot ---
@@ -1573,28 +1610,22 @@
         const getGeminiResponse = async (prompt) => {
             addTypingIndicator();
 
-            const systemInstruction = `
-                You are CrySense Assistant, a specialized AI helper for the CrySense web app. Your primary goal is to provide accurate, empathetic, and safe information to parents and caregivers.
-                **Persona:** Empathetic, Reassuring, Knowledgeable, Clear, Safe & Responsible.
-                **Core Knowledge:** You are an expert on the CrySense app (AI cry analysis, data logging, pediatrician advice feature).
-                **VERY IMPORTANT RULE:** NEVER provide medical advice. If asked for medical help, you MUST state your limitation and direct the user to a professional.
-            `;
-
             chatHistory.push({ role: "user", parts: [{ text: prompt }] });
 
-            const payload = { contents: [{ role: "model", parts: [{ text: systemInstruction }] }, ...chatHistory] };
-            const apiKey = "AIzaSyBfo5XqFONj1U-MM6ydOLts0zFLM0mG1dE";
-            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
-
             try {
-                const response = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                const response = await fetch("http://127.0.0.1:8000/chat", {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chat_history: chatHistory })
+                });
+                
                 if (!response.ok) throw new Error(`API error: ${response.statusText}`);
                 const result = await response.json();
-                const text = result.candidates[0].content.parts[0].text;
+                const text = result.text;
                 chatHistory.push({ role: "model", parts: [{ text: text }] });
                 addMessage(text, 'bot');
             } catch (error) {
-                console.error("Gemini API Error:", error);
+                console.error("Chat API Error:", error);
                 addMessage("Sorry, I'm having trouble connecting right now. Please try again later.", 'bot');
             }
         };
